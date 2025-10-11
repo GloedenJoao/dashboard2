@@ -7,7 +7,142 @@ $(document).ready(function() {
     let currentQueryResult = null; // {columns: [], data: []}
     let cards = []; // Array of dashboard cards
     let cardCounter = 0; // Unique ID counter for cards
-    let filters = []; // Array of filter objects {id, column, value}
+    let filters = []; // Array of active filters {column, value}
+    let savedDashboards = [];
+    let saveDashboardModal = null;
+
+    function getFiltersFromUI() {
+        const collected = [];
+        $('#filters-container .filter-row').each(function() {
+            const column = $(this).find('.filter-column-select').val();
+            const value = $(this).find('.filter-value-input').val().trim();
+            if (column && value) {
+                collected.push({ column, value });
+            }
+        });
+        return collected;
+    }
+
+    function showDashboardMessage(message, type = 'success') {
+        const alertBox = $('#dashboard-feedback');
+        if (!alertBox.length) return;
+        alertBox.removeClass('d-none alert-success alert-danger alert-info');
+        alertBox.addClass(`alert-${type}`);
+        alertBox.text(message);
+        if (type === 'success' || type === 'info') {
+            setTimeout(() => {
+                alertBox.addClass('d-none');
+            }, 4000);
+        }
+    }
+
+    function escapeHtml(text) {
+        return $('<div>').text(text == null ? '' : text).html();
+    }
+
+    function getSerializableCards() {
+        return cards.map(card => ({
+            id: card.id,
+            db: card.db,
+            query: card.query,
+            type: card.type,
+            title: card.title,
+            config: card.config,
+            data: card.data,
+            columns: card.columns
+        }));
+    }
+
+    function renderSavedDashboardsList() {
+        const container = $('#saved-dashboards-list');
+        container.empty();
+        if (savedDashboards.length === 0) {
+            container.append('<div class="list-group-item text-muted">Nenhum dashboard salvo até o momento.</div>');
+            return;
+        }
+        savedDashboards.forEach(dashboard => {
+            const updatedAt = dashboard.updated_at ? new Date(dashboard.updated_at).toLocaleString('pt-BR') : '';
+            const safeName = escapeHtml(dashboard.name || 'Sem nome');
+            const safeTimestamp = escapeHtml(updatedAt);
+            const timestampMarkup = updatedAt ? `<small class="text-muted">Atualizado em ${safeTimestamp}</small>` : '';
+            const item = $(`
+                <div class="list-group-item d-flex align-items-center justify-content-between gap-3">
+                    <div>
+                        <h6 class="mb-1">${safeName}</h6>
+                        ${timestampMarkup}
+                    </div>
+                    <button class="btn btn-sm btn-primary">Carregar</button>
+                </div>
+            `);
+            item.find('button').on('click', function() {
+                loadDashboard(dashboard);
+            });
+            container.append(item);
+        });
+    }
+
+    function loadSavedDashboards() {
+        $.getJSON('/api/dashboards', function(data) {
+            savedDashboards = Array.isArray(data) ? data : [];
+            renderSavedDashboardsList();
+        });
+    }
+
+    function loadDashboard(dashboard) {
+        if (!dashboard || !Array.isArray(dashboard.cards)) {
+            showDashboardMessage('Não foi possível carregar o dashboard selecionado.', 'danger');
+            return;
+        }
+        cards.forEach(card => {
+            if (card.chart) {
+                card.chart.destroy();
+            }
+        });
+        $('#dashboard-cards').empty();
+        cards = dashboard.cards.map((card, index) => ({
+            id: card.id || `card-${index}`,
+            db: card.db,
+            query: card.query,
+            type: card.type,
+            title: card.title,
+            config: card.config || {},
+            data: card.data || [],
+            columns: card.columns || [],
+            chart: null
+        }));
+        const nextCounter = cards.reduce((max, card) => {
+            if (typeof card.id === 'string') {
+                const match = card.id.match(/card-(\d+)/);
+                if (match) {
+                    return Math.max(max, parseInt(match[1], 10) + 1);
+                }
+            }
+            return max;
+        }, 0);
+        cardCounter = Math.max(nextCounter, cards.length);
+        cards.forEach(card => renderCard(card));
+        updateFilterOptions();
+
+        $('#filters-container').empty();
+        filters = Array.isArray(dashboard.filters) ? dashboard.filters.map(filter => ({
+            column: filter.column,
+            value: filter.value
+        })) : [];
+        filters.forEach(filter => addFilterRow(filter));
+        filters = getFiltersFromUI();
+        if (filters.length > 0) {
+            applyFilters(true);
+            showDashboardMessage(`Dashboard "${dashboard.name}" carregado e filtros aplicados.`, 'info');
+        } else {
+            refreshCardsData();
+            showDashboardMessage(`Dashboard "${dashboard.name}" carregado.`, 'info');
+        }
+        const dashboardTabEl = document.getElementById('dashboard-tab');
+        if (dashboardTabEl) {
+            const tabInstance = bootstrap.Tab.getOrCreateInstance(dashboardTabEl);
+            tabInstance.show();
+        }
+    }
 
     // Fetch schema and populate sidebar and DB select
     function loadSchema() {
@@ -120,7 +255,9 @@ $(document).ready(function() {
             paging: true,
             searching: true,
             info: false,
-            ordering: true
+            ordering: true,
+            scrollX: true,
+            autoWidth: false
         });
         // Populate visualization config selects
         populateVisualizationConfig(result);
@@ -201,7 +338,9 @@ $(document).ready(function() {
                 paging: false,
                 searching: false,
                 info: false,
-                ordering: true
+                ordering: true,
+                scrollX: true,
+                autoWidth: false
             });
         } else if (visType === 'bar' || visType === 'line' || visType === 'pie') {
             const categoryCol = $('#category-column').val();
@@ -346,12 +485,12 @@ $(document).ready(function() {
     });
 
     function renderCard(card) {
-        const colDiv = $('<div class="col"></div>');
+        const colDiv = $('<div class="col d-flex"></div>');
         const cardDiv = $(
-            `<div class="card" id="${card.id}">
+            `<div class="card h-100 w-100" id="${card.id}">
                 <div class="card-body">
                     <h5 class="card-title">${card.title}</h5>
-                    <div class="chart-container" style="position: relative; height: 300px;"></div>
+                    <div class="chart-container" style="min-height: 300px;"></div>
                 </div>
             </div>`
         );
@@ -378,7 +517,9 @@ $(document).ready(function() {
                 paging: true,
                 searching: true,
                 info: false,
-                ordering: true
+                ordering: true,
+                scrollX: true,
+                autoWidth: false
             });
         } else if (card.type === 'bar' || card.type === 'line' || card.type === 'pie') {
             const { labels, values } = aggregateData({ data: card.data, columns: card.columns }, card.config.categoryCol, card.config.valueCol);
@@ -419,6 +560,7 @@ $(document).ready(function() {
     // Filter handling
     $('#add-filter-btn').on('click', function() {
         addFilterRow();
+        filters = getFiltersFromUI();
     });
     $('#apply-filters-btn').on('click', function() {
         applyFilters();
@@ -446,40 +588,39 @@ $(document).ready(function() {
         });
     }
 
-    function addFilterRow() {
-        const filterId = 'filter-' + filters.length;
-        filters.push({ id: filterId, column: '', value: '' });
+    function addFilterRow(existingFilter = null) {
         const filterRow = $(
-            `<div class="row filter-row" id="${filterId}">
-                <div class="col-md-4">
+            `<div class="row filter-row align-items-center">
+                <div class="col-md-4 mb-2 mb-md-0">
                     <select class="form-select filter-column-select"></select>
                 </div>
-                <div class="col-md-5">
+                <div class="col-md-5 mb-2 mb-md-0">
                     <input type="text" class="form-control filter-value-input" placeholder="Valor do filtro">
                 </div>
-                <div class="col-md-2">
-                    <button type="button" class="btn btn-outline-danger btn-remove-filter">X</button>
+                <div class="col-md-3 text-md-end">
+                    <button type="button" class="btn btn-outline-danger btn-sm btn-remove-filter">Remover</button>
                 </div>
             </div>`
         );
         $('#filters-container').append(filterRow);
         updateFilterOptions();
-        // Bind remove button
+        if (existingFilter) {
+            filterRow.find('.filter-column-select').val(existingFilter.column || '');
+            filterRow.find('.filter-value-input').val(existingFilter.value || '');
+        }
+        filterRow.find('.filter-column-select').on('change', function() {
+            filters = getFiltersFromUI();
+        });
+        filterRow.find('.filter-value-input').on('input', function() {
+            filters = getFiltersFromUI();
+        });
         filterRow.find('.btn-remove-filter').on('click', function() {
-            removeFilterRow(filterId);
+            filterRow.remove();
+            filters = getFiltersFromUI();
         });
     }
 
-    function removeFilterRow(id) {
-        $('#' + id).remove();
-        // Remove from filters array
-        filters = filters.filter(f => f.id !== id);
-    }
-
-    function clearFilters() {
-        $('#filters-container').empty();
-        filters = [];
-        // Reset cards to original data
+    function refreshCardsData() {
         cards.forEach(card => {
             executeQuery(card.db, card.query, function(result) {
                 if (result.success) {
@@ -491,24 +632,28 @@ $(document).ready(function() {
         });
     }
 
-    function applyFilters() {
-        // Gather filters from UI
+    function clearFilters(showAlert = true) {
+        $('#filters-container').empty();
         filters = [];
-        $('#filters-container .filter-row').each(function() {
-            const id = $(this).attr('id');
-            const column = $(this).find('.filter-column-select').val();
-            const value = $(this).find('.filter-value-input').val().trim();
-            if (column && value) {
-                filters.push({ id: id, column: column, value: value });
+        refreshCardsData();
+        if (showAlert) {
+            showDashboardMessage('Filtros limpos e dados atualizados.', 'info');
+        }
+    }
+
+    function applyFilters(silent = false) {
+        filters = getFiltersFromUI();
+        if (filters.length === 0) {
+            refreshCardsData();
+            if (!silent) {
+                showDashboardMessage('Nenhum filtro definido. Os dados originais foram carregados.', 'info');
             }
-        });
-        // Apply to each card
+            return;
+        }
         cards.forEach(card => {
-            // Build filtered query: wrap original query as subquery
             let filteredQuery = `SELECT * FROM (${card.query}) AS subquery`;
             if (filters.length > 0) {
                 const whereClauses = filters.map(f => {
-                    // Add quotes around value, but handle numeric
                     const val = isNaN(f.value) ? `'${f.value}'` : f.value;
                     return `${f.column} = ${val}`;
                 });
@@ -522,7 +667,61 @@ $(document).ready(function() {
                 }
             });
         });
+        if (!silent) {
+            showDashboardMessage('Filtros aplicados com sucesso.', 'success');
+        }
     }
+
+    const saveModalEl = document.getElementById('saveDashboardModal');
+    if (saveModalEl) {
+        saveDashboardModal = new bootstrap.Modal(saveModalEl);
+    }
+
+    $('#save-dashboard-btn').on('click', function() {
+        if (cards.length === 0) {
+            showDashboardMessage('Adicione ao menos um card antes de salvar o dashboard.', 'danger');
+            return;
+        }
+        $('#dashboard-name-input').val('');
+        if (saveDashboardModal) {
+            saveDashboardModal.show();
+        }
+    });
+
+    $('#save-dashboard-form').on('submit', function(event) {
+        event.preventDefault();
+        const name = $('#dashboard-name-input').val().trim();
+        filters = getFiltersFromUI();
+        const cardPayload = getSerializableCards();
+        if (!name) {
+            showDashboardMessage('Informe um nome para salvar o dashboard.', 'danger');
+            return;
+        }
+        if (cardPayload.length === 0) {
+            showDashboardMessage('Adicione ao menos um card antes de salvar o dashboard.', 'danger');
+            return;
+        }
+        $.ajax({
+            url: '/api/dashboards',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({ name: name, cards: cardPayload, filters: filters }),
+            success: function() {
+                if (saveDashboardModal) {
+                    saveDashboardModal.hide();
+                }
+                $('#dashboard-name-input').val('');
+                showDashboardMessage('Dashboard salvo com sucesso!', 'success');
+                loadSavedDashboards();
+            },
+            error: function(xhr) {
+                const errorMessage = xhr.responseJSON && xhr.responseJSON.detail ? xhr.responseJSON.detail : 'Não foi possível salvar o dashboard.';
+                showDashboardMessage(errorMessage, 'danger');
+            }
+        });
+    });
+
+    loadSavedDashboards();
 
     // Initial load
     loadSchema();

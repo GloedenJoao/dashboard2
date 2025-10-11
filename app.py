@@ -1,6 +1,8 @@
+import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -22,6 +24,7 @@ startup with sample data so that the application is ready to use immediately.
 
 # Directory where this script resides
 BASE_DIR = Path(__file__).resolve().parent
+SAVED_DASHBOARDS_FILE = BASE_DIR / 'saved_dashboards.json'
 
 app = FastAPI()
 
@@ -37,6 +40,26 @@ DATABASES: Dict[str, str] = {
     "flights": str(BASE_DIR / 'flights.db'),
     "transactions": str(BASE_DIR / 'transactions.db'),
 }
+
+
+def read_saved_dashboards() -> List[Dict[str, Any]]:
+    """Read dashboards stored on disk as JSON."""
+    if not SAVED_DASHBOARDS_FILE.exists():
+        return []
+    try:
+        with open(SAVED_DASHBOARDS_FILE, 'r', encoding='utf-8') as fp:
+            data = json.load(fp)
+            if isinstance(data, list):
+                return data
+    except (json.JSONDecodeError, OSError):
+        return []
+    return []
+
+
+def write_saved_dashboards(dashboards: List[Dict[str, Any]]) -> None:
+    """Persist dashboards to disk."""
+    with open(SAVED_DASHBOARDS_FILE, 'w', encoding='utf-8') as fp:
+        json.dump(dashboards, fp, ensure_ascii=False, indent=2)
 
 
 def get_connection(db_name: str) -> sqlite3.Connection:
@@ -231,6 +254,82 @@ async def api_query(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'db' or 'query' parameter.")
     result = query_database(db_name, query)
     return JSONResponse(result)
+
+
+@app.get('/api/dashboards')
+async def api_get_dashboards():
+    """Return the list of saved dashboards."""
+    return JSONResponse(read_saved_dashboards())
+
+
+@app.post('/api/dashboards')
+async def api_save_dashboard(request: Request):
+    """Persist a dashboard configuration to disk."""
+    body = await request.json()
+    name = (body.get('name') or '').strip()
+    cards = body.get('cards') or []
+    filters = body.get('filters') or []
+
+    if not name:
+        raise HTTPException(status_code=400, detail='O nome do dashboard é obrigatório.')
+    if not isinstance(cards, list) or len(cards) == 0:
+        raise HTTPException(status_code=400, detail='Inclua ao menos um card no dashboard.')
+
+    sanitized_cards: List[Dict[str, Any]] = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        sanitized_cards.append({
+            'id': card.get('id'),
+            'db': card.get('db'),
+            'query': card.get('query'),
+            'type': card.get('type'),
+            'title': card.get('title'),
+            'config': card.get('config') or {},
+            'data': card.get('data') or [],
+            'columns': card.get('columns') or []
+        })
+
+    if not sanitized_cards:
+        raise HTTPException(status_code=400, detail='Não há cards válidos para salvar.')
+
+    sanitized_filters: List[Dict[str, str]] = []
+    for filter_item in filters:
+        if not isinstance(filter_item, dict):
+            continue
+        column = (filter_item.get('column') or '').strip()
+        value = (filter_item.get('value') or '').strip()
+        if column and value:
+            sanitized_filters.append({'column': column, 'value': value})
+
+    dashboards = read_saved_dashboards()
+    timestamp = datetime.utcnow().isoformat()
+    existing = next(
+        (item for item in dashboards if item.get('name', '').lower() == name.lower()),
+        None
+    )
+
+    if existing:
+        created_at = existing.get('created_at') or existing.get('updated_at') or timestamp
+        existing['cards'] = sanitized_cards
+        existing['filters'] = sanitized_filters
+        existing['updated_at'] = timestamp
+        existing['created_at'] = created_at
+        dashboard_entry = existing
+    else:
+        next_id = max((int(item.get('id', 0)) for item in dashboards), default=0) + 1
+        dashboard_entry = {
+            'id': next_id,
+            'name': name,
+            'cards': sanitized_cards,
+            'filters': sanitized_filters,
+            'created_at': timestamp,
+            'updated_at': timestamp,
+        }
+        dashboards.append(dashboard_entry)
+
+    write_saved_dashboards(dashboards)
+    return JSONResponse({'success': True, 'dashboard': dashboard_entry})
 
 
 if __name__ == '__main__':
